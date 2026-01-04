@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using System.Net;
 using Verifile.PubSub;
 using VerifileChallengeApp.Database;
 using VerifileChallengeApp.Database.Models;
@@ -12,71 +13,97 @@ namespace VerifileChallengeApp;
 
 public class GetPersonFunction
 {
-    private readonly ILogger<GetPersonFunction> logger;
-    private readonly IPublisher<Person> publisher;
-    private readonly VerifileDbContext dbContext;
     private readonly TWFUService service;
+    private readonly VerifileDbContext dbContext;
+    private readonly ILogger<GetPersonFunction> logger;
+    private readonly IPublisher<Database.Models.Person> publisher;
 
     public GetPersonFunction(
-        ILogger<GetPersonFunction> logger,
-        IPublisher<Person> publisher,
+        TWFUService service,
         VerifileDbContext dbContext,
-        TWFUService service)
+        IPublisher<Person> publisher,
+        ILogger<GetPersonFunction> logger)
     {
-        this.logger = logger;
-        this.publisher = publisher;
-        this.dbContext = dbContext;
         this.service = service;
+        this.dbContext = dbContext;
+        this.publisher = publisher;
+        this.logger = logger;
     }
 
     [Function("GetPerson")]
-    public async Task<IActionResult> RunAsync([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequest req)
+    public async Task<IActionResult> RunAsync([HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequest req)
     {
-        logger.LogInformation("HTTP trigger function started to process a request.");
-
-        var response = service.GetPersonAsync(req.Query["id"]);
-
-        if (response == null)
+        try
         {
-            return new NotFoundResult();
+            logger.LogInformation("HTTP trigger function started to process a request.");
+
+            var people = service.GetPersonAsync(req.Query["id"]);
+
+            if (people == null || !await people.AnyAsync())
+            {
+                return new NotFoundResult();
+            }
+
+            var person = await GetLatestUpdated(people);
+
+            await SaveQuarterThreeResult(people);
+
+            logger.LogInformation("HTTP trigger function completed processing the request.");
+
+            return new OkObjectResult(person);
         }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "An error occurs while processing the request");
+            return new StatusCodeResult((int)HttpStatusCode.InternalServerError);
+        }
+    }
 
-        var person = await response.OrderBy(p => p.LastUpdate).LastAsync();
-
-        var peopleOnQuarterThree = await response.Where(p => p.LastUpdate.Month is >= 7 and <= 9).ToListAsync();
+    private async Task SaveQuarterThreeResult(IAsyncEnumerable<HttpClients.TWFU.Response.Person> people)
+    {
+        var peopleOnQuarterThree = await people
+            .Where(p => p.LastUpdate.Month is >= 7 and <= 9)
+            .ToListAsync();
 
         logger.LogInformation("Found {Count} people updated in quarter three.", peopleOnQuarterThree.Count);
 
-        List<Person> peopleAdded = [];
-
         if (peopleOnQuarterThree.Count == 0)
         {
-            return new OkObjectResult(person);
+            return;
         }
+
+        var peopleOnQuarterThreeKeyed = peopleOnQuarterThree
+            .Select(p => $"{p.PersonId}:{p.LastUpdate:yyyy-MM-dd hh:mm:ss.fffffff}")
+            .ToList();
+
+        var existingPeople = await dbContext.People
+            .Where(p => peopleOnQuarterThreeKeyed.Contains(string.Concat(p.Id.ToString(), ":", p.LastUpdate.ToString())))
+            .Select(p => new { p.Id, p.LastUpdate })
+            .ToHashSetAsync();
+
+        var newPeople = peopleOnQuarterThree
+                            .ExceptBy(existingPeople.Select(p => (p.Id, p.LastUpdate)), p => (p.PersonId, p.LastUpdate))
+                            .Select(Person.FromDto);
+
+        if (!newPeople.Any())
+        {
+            logger.LogInformation("No new people to add to the database.");
+            return;
+        }
+
+        logger.LogInformation("Adding {Count} new people to the database.", newPeople.Count());
 
         var transaction = await dbContext.Database.BeginTransactionAsync();
 
         try
         {
-            foreach (var personOnQuarterThree in peopleOnQuarterThree)
-            {
-                logger.LogInformation("Checking person with ID {PersonId} and LastUpdate {LastUpdate}.", personOnQuarterThree.PersonId, personOnQuarterThree.LastUpdate);
-
-                if (!await dbContext.People.AnyAsync(p => p.Id == personOnQuarterThree.PersonId && p.LastUpdate == personOnQuarterThree.LastUpdate))
-                {
-                    logger.LogInformation("Adding new person with ID {PersonId} and LastUpdate {LastUpdate} to the database.", personOnQuarterThree.PersonId, personOnQuarterThree.LastUpdate);
-
-                    var personEntity = Person.FromDto(personOnQuarterThree);
-                    dbContext.People.Add(personEntity);
-                    peopleAdded.Add(personEntity);
-                }
-            }
+            await dbContext.People.AddRangeAsync(newPeople);
 
             logger.LogInformation("Saving changes to the database.");
 
             await dbContext.SaveChangesAsync();
 
-            var tasks = peopleAdded.Select(publisher.PublishAsync);
+            var tasks = newPeople.Select(publisher.PublishAsync);
 
             await Task.WhenAll(tasks);
 
@@ -86,11 +113,9 @@ public class GetPersonFunction
         {
             logger.LogError(ex, "An error occurred while processing people updated in quarter three.");
             await transaction.RollbackAsync();
-            return new StatusCodeResult(StatusCodes.Status500InternalServerError);
         }
-
-        logger.LogInformation("HTTP trigger function completed processing the request.");
-
-        return new OkObjectResult(person);
     }
+
+    private static async Task<HttpClients.TWFU.Response.Person> GetLatestUpdated(IAsyncEnumerable<HttpClients.TWFU.Response.Person> response) =>
+        await response.OrderBy(p => p.LastUpdate).LastAsync();
 }
