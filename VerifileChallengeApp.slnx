@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Verifile.PubSub/Verifile.PubSub.csproj" Id="9e432608-8733-44d6-8cf3-57e3c5317d46" />
+  <Project Path="VerifileChallengeApp.AppHost/VerifileChallengeApp.AppHost.csproj" />
+  <Project Path="VerifileChallengeApp.ServiceDefaults/VerifileChallengeApp.ServiceDefaults.csproj" />
+  <Project Path="VerifileChallengeApp/VerifileChallengeApp.csproj" />
+</Solution>
